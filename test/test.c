@@ -1,7 +1,13 @@
 #include <stdio.h>
 
 int main(){
-	int a = 5;
-	printf("%c\n", a + '0');
+	int kek = 0;
+	int keks = 1;
+	if(kek){
+		printf("kek");
+	}
+	if(keks){
+		printf("keks");
+	}
 	return 0;
 }

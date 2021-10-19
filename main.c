@@ -6,6 +6,12 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
+#include <fcntl.h>
+
+struct packet{
+    long upcoming;
+    long incoming;
+};
 
 long mstime(){
     struct timeval time;
@@ -13,16 +19,11 @@ long mstime(){
     return time.tv_sec * 1000000 + time.tv_usec;
 }
 
-int buffersize(char * word){
-    int k = 0;
-    for(int lit = 0; lit < strlen(word);lit++){
-        if(word[lit] == 'a') k++;
-    }
-    return k;
-}
 
 int main(int argc, char **argv) {
         short port = 5850;
+        struct timeval timeout;
+        fd_set sockets;
         struct sockaddr_in address;
         address.sin_family = AF_INET;
         address.sin_port = htons(port);
@@ -41,20 +42,30 @@ int main(int argc, char **argv) {
             printf("Listening\n");;
             char buffer[1024];
             struct sockaddr_in clientaddress;
-            int status;
-            int length = sizeof(clientaddress);
+            int status, length = sizeof(clientaddress), allisbroken;
             while (1){
-                status = recvfrom(sockt, buffer, 1024, 0, (struct sockaddr*)&clientaddress, &length);
-                if(status < 0){
-                    perror("Failed to get message.");
-                    exit(1);
+                fd_set sockets;
+                timeout.tv_sec = 0;
+                timeout.tv_usec = 1000;
+                FD_SET(sockt, &sockets);
+                status = select(sockt + 1, &sockets, NULL, NULL, &timeout);
+                if(status > 0 && FD_ISSET(sockt, &sockets)) {
+                    status = recvfrom(sockt, buffer, 1024, 0, (struct sockaddr*)&clientaddress, &length);
                 }
-                else {
+                else{
+                    allisbroken++;
+                }
+                FD_SET(sockt, &sockets);
+                status = select(sockt + 1, NULL, &sockets, NULL, &timeout);
+                if(status > 0 && FD_ISSET(sockt, &sockets)) {
                     status = sendto(sockt, buffer, status, 0, (struct sockaddr *) &clientaddress, sizeof(clientaddress));
-                    if(status < 0){
-                        printf("Failed to send message.");
-                        exit(1);
+                }
+                else{
+                    if(allisbroken == 100){
+                        printf("Something goes wrong with connection or client side");
+                        exit(EXIT_FAILURE);
                     }
+                    allisbroken++;
                 }
             }
         }
@@ -77,35 +88,68 @@ int main(int argc, char **argv) {
             } else {
                 printf("Client running \nIP:%s\nPacket size:%d\nPacket per second:%d\nTest duration:%d\n", argv[1], size, package_per_second, duration);
                 address.sin_addr.s_addr = inet_addr(argv[1]);
-                long temp = 0;
-                long maxtemp = 0;
-                long clocksumm = 0;
-                int status = 0;
+                short server_stuck = 0, status = 0, index = 0, packet_loss = 0;
+                const int second_delay = 1000000 / package_per_second, seconds_delay = 1000000 - second_delay, packet_amount = package_per_second * duration;
+                int delay = 0, len = sizeof(address);
+                long temp = 0, maxdelay = 0, clocksumm = 0;
                 char buffer[size];
-                int len = sizeof(address);
-                int second_delay = 1000000 / package_per_second;
-                int seconds_delay = 1000000 - second_delay;
+                for(int lit = 0; lit < size; lit++){
+                    buffer[lit] = 'a';
+                }
+                long packets[packet_amount];
+                bzero(packets, size);
+                timeout.tv_sec = 0;
+                timeout.tv_usec = second_delay;
                 for (int seconds = duration; seconds > 0; seconds--) {
-                    printf("%i Second(s) remain\n ", seconds);
+                    printf("%i Second(s) remain\n", seconds);
                     for (int second = 0; second < package_per_second; second++) {
-                        temp = mstime();
-                        status = sendto(sockt, buffer, strlen(buffer), 0, (struct sockaddr *) &address,sizeof(address));
-                        status = recvfrom(sockt, buffer, size, 0, (struct sockaddr *) &address, &len);
-                        temp = mstime() - temp;
-                        if (status == 0) {
-                            perror("Server is unreachable");
-                            exit(1);
-                            }
-                        if (temp > maxtemp){
-                            maxtemp = temp;
+                        temp = 0;
+                        index = (duration - seconds) * package_per_second + second;
+                        packets[index] = mstime();
+                        for(int i = 3; i >= 0; i--){
+                            buffer[i] = index % 10 + 48;
+                            index /= 10;
                         }
-                        clocksumm += temp;
+                        FD_SET(sockt, &sockets);
+                        status = select(sockt + 1, NULL, &sockets, NULL, &timeout);
+                        if(status > 0 && FD_ISSET(sockt, &sockets)) {
+                            status = sendto(sockt, buffer, strlen(buffer), 0, (struct sockaddr *) &address,
+                                            sizeof(address));
+                        }
+                        FD_SET(sockt, &sockets);
+                        status = select(sockt + 1, &sockets, NULL, NULL, &timeout);
+                        if(status > 0 && FD_ISSET(sockt, &sockets)) {
+                            server_stuck = 0;
+                            status = recvfrom(sockt, buffer, size + 1, 0, (struct sockaddr *) &address, &len);
+                            temp = mstime();
+                            index = (buffer[0] - 48) * 1000 + (buffer[1] - 48) * 100 + (buffer[2] - 48) * 10 + buffer[3] - 48;
+                            if(packets[index] > 1000000){
+                                packets[index] = temp - packets[index];
+                                clocksumm += packets[index];
+                            }
+                        }
+                        else{
+                            if(server_stuck == package_per_second){
+                                perror("Server isn't responding.\n");
+                                exit(EXIT_FAILURE);
+                            }
+                            server_stuck++;
+                        }
                     }
                     usleep(seconds_delay);
                 }
-                printf("Maximum delay is:%fms, Average delay is:%fms\n", (float)maxtemp / 2000000, (float)(clocksumm / (package_per_second * duration)) / 2000000);
-            }
-        }
+                for(int i = 0; i < package_per_second * duration; i++){
+                    if(packets[i] < 1000000){
+                        if(packets[i] > maxdelay) {
+                            maxdelay = packets[i];
+                        }
+                    }
+                    else {
+                        packet_loss++;
+                    }
+                    }
+                printf("Maximum delay is:%fms, Average delay is:%fms, Packet loss is:%f\n", (float)maxdelay / 2000, (float)(clocksumm / (package_per_second * duration - packet_loss)) / 2000, (float)packet_loss / packet_amount);
+            }}
         else {
             printf("Incorrect input. To run client you need enter:\n<IP> <Packet size> <Packet per second> <Test duracity>\n");
         }
